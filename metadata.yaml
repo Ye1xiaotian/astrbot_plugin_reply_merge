@@ -1,6 +1,11 @@
 name: astrbot_plugin_reply_merge
 display_name: 思维链式消息防抖
+short_desc: LLM 思维链判断用户是否说完，连发消息合并为一次回复
 desc: 消息触发 LLM 后进入合并窗口：等待期间由 LLM 思维链真正思考用户已发来的消息，判断用户是否说完并决定再等多久（思考失败退回随机等待），窗口期内同一用户连发的消息与表情包合并进同一次请求，只回复一条。可用 /思维链 命令查看最近一轮思考。
 version: v1.1.0
 author: Ye1xiaotian
 repo: https://github.com/Ye1xiaotian/astrbot_plugin_reply_merge
+tags:
+  - 消息防抖
+  - 思维链
+  - 拟人

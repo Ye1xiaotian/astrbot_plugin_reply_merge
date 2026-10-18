@@ -1,0 +1,64 @@
+{
+    "min_wait": {
+        "description": "安静期下限（秒）",
+        "hint": "最后一条消息到达后至少再等这么久，期间没有新消息才回复。思维链思考给出的等待时长会被钳制在该范围内；思考失败或关闭时退回在此范围内随机（模仿真人阅读）。",
+        "type": "int",
+        "default": 5,
+        "slider": {
+            "min": 1,
+            "max": 30,
+            "step": 1
+        }
+    },
+    "max_wait": {
+        "description": "安静期上限（秒）",
+        "hint": "安静期上限。窗口期内每来一条新消息都会重新思考并重新决定安静期（滑动合并）。",
+        "type": "int",
+        "default": 15,
+        "slider": {
+            "min": 2,
+            "max": 60,
+            "step": 1
+        }
+    },
+    "max_window": {
+        "description": "合并窗口总时长上限（秒）",
+        "hint": "从第一条消息算起，无论连发多少条，窗口最多存活这么久，防止用户一直发消息导致机器人一直不回复。",
+        "type": "int",
+        "default": 60,
+        "slider": {
+            "min": 10,
+            "max": 300,
+            "step": 10
+        }
+    },
+    "max_followups": {
+        "description": "最多合并后续消息条数",
+        "hint": "窗口内最多合并多少条后续消息，超出的以省略标记带过。",
+        "type": "int",
+        "default": 10,
+        "slider": {
+            "min": 2,
+            "max": 30,
+            "step": 1
+        }
+    },
+    "forward_images": {
+        "description": "转发后续图片/表情包",
+        "hint": "把窗口期内用户发来的图片一并附给模型，与首条图片走同样的下载缩放流程（需要多模态模型才有视觉理解，纯文本模型只会看到占位标记）。",
+        "type": "bool",
+        "default": true
+    },
+    "enable_thinking": {
+        "description": "启用思维链思考",
+        "hint": "开启后，等待期间会用 LLM 真正思考用户已发来的消息：判断用户是否说完、决定再等多久，每轮思考能看到上一轮思考（思维链），最后一轮思考会提供给最终回复作参考。思考失败时自动退回随机等待。",
+        "type": "bool",
+        "default": true
+    },
+    "think_provider_id": {
+        "description": "思考所用模型 Provider ID（可选）",
+        "hint": "留空则使用会话当前模型。可填写一个更快更便宜的小模型 ID，思考更快、成本更低。",
+        "type": "string",
+        "default": ""
+    }
+}

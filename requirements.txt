@@ -1,0 +1,2 @@
+# No third-party dependencies; only AstrBot core APIs and the standard
+# library are used.

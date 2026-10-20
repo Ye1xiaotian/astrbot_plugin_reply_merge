@@ -4,18 +4,25 @@ chain-of-thought.
 When a message is about to hit the LLM, the request opens a merge window
 (one per session+sender) and holds the reply. Instead of a blind random
 timer, the leader runs a lightweight "inner thought" pass over everything
-the user has sent so far: the thought judges whether the user has finished
-talking and decides how much longer to wait. Every follow-up message
-donated into the window wakes the leader and triggers another thought pass
-that sees the previous thought, forming a real reasoning chain. When the
-window finally goes quiet, the last thought is injected into the final
-request so the persona call starts from that understanding and answers all
-messages at once.
+the user has sent so far. Each pass produces a structured understanding
+(per-message points, an overall judgment, open questions) plus a decision:
+reply now, or keep waiting for a suggested number of seconds. Every
+follow-up message donated into the window wakes the leader and triggers
+another thought pass that sees the previous structured thought, forming a
+reasoning chain with low information loss. When the window finally goes
+quiet (or the model says reply), the latest structured understanding is
+injected into the final request so the persona call starts from it and
+answers all messages at once.
+
+The thought pass is told how long the window has been open and how much is
+left before the hard cap, and every pass logs both the model-requested
+wait and the effective (clamped) wait, so scheduling behavior is
+measurable from logs.
 
 Failure isolation: if thinking is disabled, the thinking model call fails,
 or its JSON verdict cannot be parsed, the window falls back to the
-original behavior — a random quiet period (5-15s by default) that
-mimics a human reading pause.
+original behavior — a random quiet period (5-15s by default) that mimics
+a human reading pause.
 
 Window lifecycle (per merge key = unified_msg_origin:sender_id):
 
@@ -25,8 +32,9 @@ Window lifecycle (per merge key = unified_msg_origin:sender_id):
 - Messages arriving while the window is open are stopped at the event
   handler stage; their text/images are donated to the window and the
   leader is woken up to think again.
-- The loop exits when the thought-set quiet period passes with no new
-  messages, or the hard cap (window start + max_window) is reached.
+- The loop exits when the verdict-armed deadline passes with no new
+  messages, the verdict says reply, or the hard cap (window start +
+  max_window) is reached.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ import asyncio
 import json
 import random
 import time
+from dataclasses import dataclass
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -54,13 +63,14 @@ THOUGHT_MARKER = (
 
 THINK_SYSTEM_PROMPT = (
     "你是一个聊天机器人的内心思考模块。用户正在给你的宿主机器人连发消息，"
-    "机器人需要决定等多久再回复。请结合用户已发来的全部消息快速思考："
-    "用户到底想表达或询问什么；用户是说完了，还是很可能继续连发。"
-    '只输出一个 JSON 对象：{"thought": "一句话第一人称内心思考，不超过60字", '
-    '"wait": 建议再安静等待的整数秒数}。'
-    "wait 取值参考：用户已说完或是完整的问题给 3~8；不确定给 10~15；"
-    "明显没说完（话说到一半、正在列举、刚发省略号或问号、正在连发表情包）给 15~25。"
-    "不要输出 JSON 以外的任何内容。"
+    "你需要判断用户是否说完，并决定现在回复还是继续等待。"
+    '只输出一个 JSON 对象：{"points": ["对用户每条消息的逐条理解，一条一个短句"], '
+    '"summary": "总体判断：用户想做什么、是否说完（第一人称，50字内）", '
+    '"questions": ["尚未明确、需要用户补充的信息，没有则为空数组"], '
+    '"action": "reply或wait", "wait": 建议再安静等待的整数秒数}。'
+    "action 取值：用户明显说完或是完整问题给 reply；不确定给 wait 且 wait 取 10~15；"
+    "明显没说完（话说到一半、正在列举、刚发省略号或问号、正在连发表情包）"
+    "给 wait 且 wait 取 15~25。不要输出 JSON 以外的任何内容。"
 )
 
 # Seconds to sleep after a donation before thinking, so a rapid sticker or
@@ -69,6 +79,9 @@ THINK_SETTLE_SECONDS = 1.0
 # Upper bound of thought passes per window, bounding LLM cost when a user
 # keeps talking until the hard cap.
 THINK_PASS_LIMIT = 10
+# Human-feel pause used when the verdict action is "reply": it skips the
+# min_wait floor but still avoids an instant bot-like answer.
+THINK_REPLY_PAUSE = 2.0
 
 
 def merge_key(event: AstrMessageEvent) -> str:
@@ -81,6 +94,45 @@ def merge_key(event: AstrMessageEvent) -> str:
         The key combining the unified message origin and the sender id.
     """
     return f"{event.unified_msg_origin}:{event.get_sender_id()}"
+
+
+@dataclass
+class Verdict:
+    """One parsed inner-thought pass.
+
+    Attributes:
+        points: Per-message understanding, one short line per message.
+        summary: Overall first-person judgment of intent and completeness.
+        questions: Information still missing from the user, may be empty.
+        action: "reply" or "wait" from the model; "fallback" marks a pass
+            whose call/parse failed and whose wait is a random draw.
+        wait: Model-requested quiet seconds; for fallback passes this is
+            the random quiet that was actually used.
+    """
+
+    points: list[str]
+    summary: str
+    questions: list[str]
+    action: str
+    wait: float
+
+
+def format_thought(verdict: Verdict) -> str:
+    """Render one structured thought as compact plain lines.
+
+    Args:
+        verdict: The parsed thought to render.
+
+    Returns:
+        The block reused for the next pass's chain input, the final-prompt
+        injection and the show_thoughts command.
+    """
+    lines = [f"- {p}" for p in verdict.points]
+    if verdict.summary:
+        lines.append(f"总体判断：{verdict.summary}")
+    if verdict.questions:
+        lines.append("未解决：" + "；".join(verdict.questions))
+    return "\n".join(lines)
 
 
 class MergeWindow:
@@ -97,9 +149,10 @@ class MergeWindow:
         """
         self.buffer: list[str] = []
         self.images: list[str] = []
-        self.thoughts: list[str] = []
+        self.thoughts: list[Verdict] = []
         self.waits: list[float] = []
         now = time.monotonic()
+        self.started_at = now
         self.hard_cap = now + max(1.0, max_window)
         self.deadline = min(self.hard_cap, now + quiet_seconds)
         # Starts set so the leader immediately thinks about its own first
@@ -170,20 +223,26 @@ class ReplyMergePlugin(Star):
         return sources
 
     async def _think(
-        self, event: AstrMessageEvent, first_message: str, window: MergeWindow
-    ) -> tuple[str, float] | None:
+        self,
+        event: AstrMessageEvent,
+        first_message: str,
+        window: MergeWindow,
+        elapsed: float,
+        remaining: float,
+    ) -> Verdict | None:
         """Run one inner-thought pass over everything sent so far.
 
         Args:
             event: The leader event, used to resolve the session provider.
             first_message: The leader's own prompt text.
             window: The open window holding follow-ups and past thoughts.
+            elapsed: Seconds since the window opened.
+            remaining: Seconds left before the hard cap closes it.
 
         Returns:
-            (thought, quiet_seconds) from the verdict, or None when
-            thinking is unavailable (no provider, call failure, or an
-            unparsable verdict); the caller then falls back to a random
-            quiet period.
+            The parsed Verdict, or None when thinking is unavailable (no
+            provider, call failure, or an unparsable verdict); the caller
+            then falls back to a random quiet period.
         """
         provider_id = str(self.config.get("think_provider_id", "") or "").strip()
         provider = (
@@ -197,11 +256,16 @@ class ReplyMergePlugin(Star):
             logger.warning("[merge] no provider for thinking; random quiet")
             return None
 
-        lines = [f"用户发的第一条消息：{first_message or '（无文字）'}"]
+        lines = [
+            f"[窗口状态] 已等待 {elapsed:.0f} 秒；"
+            f"距强制收尾还剩 {max(0.0, remaining):.0f} 秒；"
+            f"已收到 {1 + len(window.buffer)} 条消息",
+            f"用户发的第一条消息：{first_message or '（无文字）'}",
+        ]
         if window.buffer:
             lines.append("用户随后连发的消息：\n" + "\n".join(window.buffer))
-        if window.thoughts and window.thoughts[-1]:
-            lines.append(f"你上一轮的内心思考：{window.thoughts[-1]}")
+        if window.thoughts and window.thoughts[-1].summary:
+            lines.append(f"你上一轮的思考：\n{format_thought(window.thoughts[-1])}")
         lines.append("请输出这一轮的 JSON。")
 
         try:
@@ -217,21 +281,30 @@ class ReplyMergePlugin(Star):
 
         try:
             start, end = raw.find("{"), raw.rfind("}")
-            verdict = json.loads(raw[start : end + 1])
-            thought = str(verdict.get("thought", "")).strip()
-            quiet = float(verdict["wait"])
+            data = json.loads(raw[start : end + 1])
+            points = [str(p).strip() for p in data.get("points", []) if str(p).strip()]
+            summary = str(data.get("summary", "")).strip()
+            questions = [
+                str(q).strip() for q in data.get("questions", []) if str(q).strip()
+            ]
+            action = str(data.get("action", "wait")).strip().lower()
+            if action not in ("reply", "wait"):
+                action = "wait"
+            try:
+                wait = float(data.get("wait"))
+            except (TypeError, ValueError):
+                wait = 0.0
             # json.loads accepts NaN/Infinity; reject absurd values so the
-            # deadline stays a sane finite number.
-            if not (0 < quiet < 3600):
-                raise ValueError
+            # deadline stays a sane finite number. A missing wait is fatal
+            # only when the model actually wants us to keep waiting.
+            if wait != wait or not (0 < wait < 3600):
+                if action != "reply":
+                    raise ValueError
+                wait = THINK_REPLY_PAUSE
         except (ValueError, KeyError, TypeError):
             logger.warning(f"[merge] unparsable thought verdict: {raw[:200]}")
             return None
-        quiet = min(
-            max(quiet, float(self.config.get("min_wait", 5))),
-            float(self.config.get("max_wait", 15)),
-        )
-        return thought, quiet
+        return Verdict(points, summary, questions, action, wait)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def collect_followup(self, event: AstrMessageEvent) -> None:
@@ -261,11 +334,12 @@ class ReplyMergePlugin(Star):
         """Hold the request in a thought-driven window, then merge in follow-ups.
 
         The leader loops: wake up on the first message or any donation,
-        run a thought pass, and arm the quiet deadline from the verdict.
-        It returns when the window has been quiet for a full period (or
-        the hard cap). A request that arrives while a window is open
-        loses the race, donates its own content to the winner and is
-        stopped.
+        run a thought pass, and arm the quiet deadline from the verdict
+        (a "reply" verdict arms the short human-feel pause instead of the
+        clamped wait). It returns when the window has been quiet for a
+        full period (or the hard cap). A request that arrives while a
+        window is open loses the race, donates its own content to the
+        winner and is stopped.
 
         Args:
             event: Incoming message event.
@@ -291,7 +365,8 @@ class ReplyMergePlugin(Star):
         try:
             logger.info(f"[merge] leader opened a thinking window ({key})")
             while True:
-                if time.monotonic() >= window.hard_cap:
+                now = time.monotonic()
+                if now >= window.hard_cap:
                     break
                 if window.wakeup.is_set():
                     window.wakeup.clear()
@@ -299,22 +374,41 @@ class ReplyMergePlugin(Star):
                         # Let a rapid burst settle, then reason over all
                         # messages seen so far (chain: previous thought in).
                         await asyncio.sleep(THINK_SETTLE_SECONDS)
-                        verdict = await self._think(event, req.prompt or "", window)
+                        now = time.monotonic()
+                        verdict = await self._think(
+                            event,
+                            req.prompt or "",
+                            window,
+                            elapsed=now - window.started_at,
+                            remaining=window.hard_cap - now,
+                        )
                         passes += 1
                         if verdict is not None:
-                            window.thoughts.append(verdict[0])
-                            quiet = verdict[1]
+                            if verdict.action == "reply":
+                                quiet = THINK_REPLY_PAUSE
+                            else:
+                                quiet = min(
+                                    max(
+                                        verdict.wait,
+                                        float(self.config.get("min_wait", 5)),
+                                    ),
+                                    float(self.config.get("max_wait", 15)),
+                                )
+                            window.thoughts.append(verdict)
                             logger.info(
-                                f"[merge] thought pass {passes} "
-                                f"(wait {quiet:.0f}s, "
-                                f"{len(window.buffer)} follow-ups): {verdict[0]}"
+                                f"[merge] thought pass {passes}: "
+                                f"action={verdict.action} "
+                                f"requested={verdict.wait:.0f}s "
+                                f"effective={quiet:.0f}s | {verdict.summary}"
                             )
                         else:
-                            window.thoughts.append("")
                             quiet = self._random_quiet()
+                            window.thoughts.append(
+                                Verdict([], "", [], "fallback", quiet)
+                            )
                             logger.info(
-                                f"[merge] thought pass {passes} failed; "
-                                f"random quiet {quiet:.0f}s"
+                                f"[merge] thought pass {passes}: fallback "
+                                f"effective={quiet:.0f}s"
                             )
                         window.waits.append(quiet)
                         window.deadline = min(window.hard_cap, time.monotonic() + quiet)
@@ -348,15 +442,23 @@ class ReplyMergePlugin(Star):
             "time": time.strftime("%m-%d %H:%M:%S"),
             "messages": [(req.prompt or "").strip()]
             + [entry.lstrip("- ").strip() for entry in window.buffer],
-            "thoughts": list(window.thoughts),
-            "waits": list(window.waits),
+            "thoughts": [
+                {
+                    "points": v.points,
+                    "summary": v.summary,
+                    "questions": v.questions,
+                    "action": v.action,
+                    "wait": w,
+                }
+                for v, w in zip(window.thoughts, window.waits)
+            ],
         }
         if len(self.last_chain) > 100:
             self.last_chain.pop(next(iter(self.last_chain)))
 
         parts: list[str] = []
-        if window.thoughts and window.thoughts[-1]:
-            parts.append(f"{THOUGHT_MARKER}\n{window.thoughts[-1]}")
+        if window.thoughts and window.thoughts[-1].summary:
+            parts.append(f"{THOUGHT_MARKER}\n{format_thought(window.thoughts[-1])}")
         if window.buffer:
             limit = max(1, int(self.config.get("max_followups", 10)))
             shown = window.buffer[:limit]
@@ -378,8 +480,9 @@ class ReplyMergePlugin(Star):
         """Show the latest thought chain of the current chat.
 
         Renders the most recently finished merge window of this session:
-        the messages that were merged and every thought pass with its
-        wait verdict, so the bot's reasoning is inspectable from chat.
+        the messages that were merged and every structured thought pass
+        with its action and effective wait, so the bot's reasoning is
+        inspectable from chat.
 
         Args:
             event: Command event.
@@ -395,9 +498,13 @@ class ReplyMergePlugin(Star):
             messages.append(f"…等{len(chain['messages']) - 5}条")
         lines = [f"🧠 最近一轮思考（{chain['time']}，共{len(chain['thoughts'])}轮）"]
         lines.append("📩 " + " / ".join(m for m in messages if m))
-        for i, (thought, wait) in enumerate(zip(chain["thoughts"], chain["waits"]), 1):
-            if thought:
-                lines.append(f"{i}. {thought}（等{wait:.0f}秒）")
-            else:
-                lines.append(f"{i}. （思考失败，退回随机等待{wait:.0f}秒）")
+        for i, v in enumerate(chain["thoughts"], 1):
+            if v["action"] == "fallback":
+                lines.append(f"{i}. （思考失败，退回随机等待{v['wait']:.0f}秒）")
+                continue
+            lines.append(f"{i}. [{v['action']}·等{v['wait']:.0f}秒] {v['summary']}")
+            for p in v["points"]:
+                lines.append(f"   · {p}")
+            if v["questions"]:
+                lines.append("   ❓ " + "；".join(v["questions"]))
         yield event.plain_result("\n".join(lines))

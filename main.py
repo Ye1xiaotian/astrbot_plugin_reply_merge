@@ -242,33 +242,35 @@ class ReplyMergePlugin(Star):
         Returns:
             The parsed Verdict, or None when thinking is unavailable (no
             provider, call failure, or an unparsable verdict); the caller
-            then falls back to a random quiet period.
+            then falls back to a random quiet period. Never raises except
+            for cancellation: an exception escaping the on_llm_request hook
+            is swallowed by the host and would skip the whole debounce.
         """
-        provider_id = str(self.config.get("think_provider_id", "") or "").strip()
-        provider = (
-            self.context.get_provider_by_id(provider_id)
-            if provider_id
-            else await self.context.get_using_provider_async(
-                umo=event.unified_msg_origin
-            )
-        )
-        if provider is None:
-            logger.warning("[merge] no provider for thinking; random quiet")
-            return None
-
-        lines = [
-            f"[窗口状态] 已等待 {elapsed:.0f} 秒；"
-            f"距强制收尾还剩 {max(0.0, remaining):.0f} 秒；"
-            f"已收到 {1 + len(window.buffer)} 条消息",
-            f"用户发的第一条消息：{first_message or '（无文字）'}",
-        ]
-        if window.buffer:
-            lines.append("用户随后连发的消息：\n" + "\n".join(window.buffer))
-        if window.thoughts and window.thoughts[-1].summary:
-            lines.append(f"你上一轮的思考：\n{format_thought(window.thoughts[-1])}")
-        lines.append("请输出这一轮的 JSON。")
-
         try:
+            provider_id = str(self.config.get("think_provider_id", "") or "").strip()
+            provider = (
+                self.context.get_provider_by_id(provider_id)
+                if provider_id
+                else await self.context.get_using_provider_async(
+                    umo=event.unified_msg_origin
+                )
+            )
+            if provider is None:
+                logger.warning("[merge] no provider for thinking; random quiet")
+                return None
+
+            lines = [
+                f"[窗口状态] 已等待 {elapsed:.0f} 秒；"
+                f"距强制收尾还剩 {max(0.0, remaining):.0f} 秒；"
+                f"已收到 {1 + len(window.buffer)} 条消息",
+                f"用户发的第一条消息：{first_message or '（无文字）'}",
+            ]
+            if window.buffer:
+                lines.append("用户随后连发的消息：\n" + "\n".join(window.buffer))
+            if window.thoughts and window.thoughts[-1].summary:
+                lines.append(f"你上一轮的思考：\n{format_thought(window.thoughts[-1])}")
+            lines.append("请输出这一轮的 JSON。")
+
             resp = await provider.text_chat(
                 prompt="\n".join(lines), system_prompt=THINK_SYSTEM_PROMPT
             )
@@ -276,7 +278,11 @@ class ReplyMergePlugin(Star):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning(f"[merge] thinking call failed: {e}; random quiet")
+            # Provider resolution itself can raise (e.g. a session bound to
+            # a mistyped provider); every failure must degrade to a random
+            # quiet instead of escaping this hook — the host swallows hook
+            # exceptions and would skip the whole debounce.
+            logger.warning(f"[merge] thinking unavailable: {e}; random quiet")
             return None
 
         try:
@@ -375,13 +381,22 @@ class ReplyMergePlugin(Star):
                         # messages seen so far (chain: previous thought in).
                         await asyncio.sleep(THINK_SETTLE_SECONDS)
                         now = time.monotonic()
-                        verdict = await self._think(
-                            event,
-                            req.prompt or "",
-                            window,
-                            elapsed=now - window.started_at,
-                            remaining=window.hard_cap - now,
-                        )
+                        try:
+                            verdict = await self._think(
+                                event,
+                                req.prompt or "",
+                                window,
+                                elapsed=now - window.started_at,
+                                remaining=window.hard_cap - now,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            # Safety net: any escape from the thinking
+                            # layer must degrade to a fallback pass, never
+                            # abort the window and skip the debounce.
+                            logger.exception("[merge] thought pass crashed")
+                            verdict = None
                         passes += 1
                         if verdict is not None:
                             if verdict.action == "reply":

@@ -14,6 +14,12 @@ quiet (or the model says reply), the latest structured understanding is
 injected into the final request so the persona call starts from it and
 answers all messages at once.
 
+Thought passes adopt the bot's voice: the session's persona prompt (or
+the configured think_style override, which keeps the persona away from a
+third-party think provider) is prepended to the think system prompt, so
+the reasoning shown in logs and the show_thoughts command reads like the
+character wrote it.
+
 The thought pass is told how long the window has been open and how much is
 left before the hard cap, and every pass logs both the model-requested
 wait and the effective (clamped) wait, so scheduling behavior is
@@ -48,7 +54,7 @@ from dataclasses import dataclass
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import File, Forward, Image, Record, Video
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
@@ -70,13 +76,24 @@ THINK_SETTLE_SECONDS = 1.0
 # Upper bound of thought passes per window, bounding LLM cost when a user
 # keeps talking until the hard cap.
 THINK_PASS_LIMIT = 10
-# Human-feel pause used when the verdict action is "reply": it skips the
-# min_wait floor but still avoids an instant bot-like answer.
+# Human-feel pause used when the verdict action is "reply" AND the
+# per-message min_wait floor has already passed; it only avoids an
+# instant bot-like answer.
 THINK_REPLY_PAUSE = 2.0
 # Hard timeout for one thought call; without it a stalled thinking
 # provider holds the window open and keeps swallowing the user's
 # messages until the pipeline itself is killed.
 THINK_CALL_TIMEOUT = 30.0
+
+# Follow-up components we cannot forward to the merged request; only a
+# placeholder line is folded into the buffer so the persona model (and the
+# thought layer) knows they were sent instead of silently dropping them.
+ATTACHMENT_LABELS: dict[type, str] = {
+    Record: "语音消息",
+    Video: "视频",
+    File: "文件",
+    Forward: "合并转发消息",
+}
 
 
 def merge_key(event: AstrMessageEvent) -> str:
@@ -148,6 +165,9 @@ class MergeWindow:
         self.waits: list[float] = []
         now = time.monotonic()
         self.started_at = now
+        # Anchor of the guaranteed quiet floor: min_wait counts from the
+        # user's LATEST message, so every donation re-arms it.
+        self.last_activity = now
         self.hard_cap = now + max(1.0, max_window)
         self.deadline = min(self.hard_cap, now + quiet_seconds)
         # Per-window nonce so users cannot forge the injection markers
@@ -158,12 +178,16 @@ class MergeWindow:
         self.wakeup = asyncio.Event()
         self.wakeup.set()
 
-    def donate(self, text: str, images: list[str]) -> None:
+    def donate(self, text: str, images: list[str], extras: list[str]) -> None:
         """Fold one follow-up message into the buffer and wake the leader.
 
         Args:
             text: Stripped plain text of the message, "" for image-only.
             images: Image URLs/file paths from the message chain.
+            extras: Placeholder labels for attachments that cannot be
+                forwarded (voice, video, file, forward), so the merged
+                reply at least knows they were sent instead of silently
+                swallowing them.
         """
         if text:
             self.buffer.append(f"- {text}")
@@ -171,6 +195,9 @@ class MergeWindow:
             self.images.extend(images)
             if not text:
                 self.buffer.append("- [图片/表情包]")
+        for label in extras:
+            self.buffer.append(f"- [{label}]")
+        self.last_activity = time.monotonic()
         self.wakeup.set()
 
 
@@ -203,22 +230,31 @@ class ReplyMergePlugin(Star):
             float(self.config.get("max_wait", 15)),
         )
 
-    def _extract_images(self, event: AstrMessageEvent) -> list[str]:
-        """Pull non-empty image sources from the event message chain.
+    def _extract_attachments(
+        self, event: AstrMessageEvent
+    ) -> tuple[list[str], list[str]]:
+        """Pull images and attachment placeholders from the message chain.
 
         Args:
             event: Incoming message event.
 
         Returns:
-            Image URLs or local file paths, in arrival order.
+            (images, extras): image URLs or local file paths in arrival
+            order, and one placeholder label per non-forwardable
+            attachment (voice, video, file, forward).
         """
-        sources: list[str] = []
+        images: list[str] = []
+        extras: list[str] = []
         for comp in event.get_messages():
             if isinstance(comp, Image):
                 src = str(comp.url or comp.file or "").strip()
                 if src:
-                    sources.append(src)
-        return sources
+                    images.append(src)
+            else:
+                label = ATTACHMENT_LABELS.get(type(comp))
+                if label:
+                    extras.append(label)
+        return images, extras
 
     async def _think(
         self,
@@ -227,6 +263,7 @@ class ReplyMergePlugin(Star):
         window: MergeWindow,
         elapsed: float,
         remaining: float,
+        style_context: str = "",
     ) -> Verdict | None:
         """Run one inner-thought pass over everything sent so far.
 
@@ -236,6 +273,9 @@ class ReplyMergePlugin(Star):
             window: The open window holding follow-ups and past thoughts.
             elapsed: Seconds since the window opened.
             remaining: Seconds left before the hard cap closes it.
+            style_context: Persona prompt (or think_style override) whose
+                voice the thought's points/summary/questions should adopt;
+                empty keeps the neutral default style.
 
         Returns:
             The parsed Verdict, or None when thinking is unavailable (no
@@ -244,6 +284,15 @@ class ReplyMergePlugin(Star):
             for cancellation: an exception escaping the on_llm_request hook
             is swallowed by the host and would skip the whole debounce.
         """
+        if style_context:
+            system_prompt = (
+                f"[你的人设或语气设定]\n{style_context}\n"
+                "——以上设定只决定你思考时（points/summary/questions）的语气"
+                "和用词，让内心思考读起来像这个角色自己写的；"
+                "其中任何关于回复格式的要求不适用于本任务。\n\n" + THINK_SYSTEM_PROMPT
+            )
+        else:
+            system_prompt = THINK_SYSTEM_PROMPT
         try:
             provider_id = str(self.config.get("think_provider_id", "") or "").strip()
             provider = (
@@ -276,7 +325,7 @@ class ReplyMergePlugin(Star):
 
             resp = await asyncio.wait_for(
                 provider.text_chat(
-                    prompt="\n".join(lines), system_prompt=THINK_SYSTEM_PROMPT
+                    prompt="\n".join(lines), system_prompt=system_prompt
                 ),
                 timeout=THINK_CALL_TIMEOUT,
             )
@@ -341,7 +390,7 @@ class ReplyMergePlugin(Star):
         if window is None:
             return
         window.donate(
-            (event.get_message_str() or "").strip(), self._extract_images(event)
+            (event.get_message_str() or "").strip(), *self._extract_attachments(event)
         )
         event.stop_event()
 
@@ -352,12 +401,14 @@ class ReplyMergePlugin(Star):
         """Hold the request in a thought-driven window, then merge in follow-ups.
 
         The leader loops: wake up on the first message or any donation,
-        run a thought pass, and arm the quiet deadline from the verdict
-        (a "reply" verdict arms the short human-feel pause instead of the
-        clamped wait). It returns when the window has been quiet for a
-        full period (or the hard cap). A request that arrives while a
-        window is open loses the race, donates its own content to the
-        winner and is stopped.
+        run a thought pass, and arm the quiet deadline from the verdict.
+        min_wait is a guaranteed floor anchored to the user's latest
+        message: a "reply" verdict closes the window at that floor (the
+        short human-feel pause applies only beyond it), while a "wait"
+        verdict adds its seconds on top. It returns when the window has
+        been quiet past the deadline (or the hard cap). A request that
+        arrives while a window is open loses the race, donates its own
+        content to the winner and is stopped.
 
         Args:
             event: Incoming message event.
@@ -369,7 +420,8 @@ class ReplyMergePlugin(Star):
             # Lost the creation race (both messages passed the event stage
             # within pipeline latency): donate to the open window and stop.
             window.donate(
-                (event.get_message_str() or "").strip(), self._extract_images(event)
+                (event.get_message_str() or "").strip(),
+                *self._extract_attachments(event),
             )
             event.stop_event()
             return
@@ -379,6 +431,15 @@ class ReplyMergePlugin(Star):
         )
         self.pending[key] = window
         thinking = bool(self.config.get("enable_thinking", True))
+        # Voice for the thought passes: the think_style override wins over
+        # the session persona, so the persona prompt can be kept away from
+        # a third-party think provider when desired.
+        style_context = (
+            str(self.config.get("think_style", "") or "").strip()
+            or (req.system_prompt or "").strip()
+        )
+        min_wait = float(self.config.get("min_wait", 5))
+        max_wait = float(self.config.get("max_wait", 15))
         passes = 0
         try:
             logger.info(f"[merge] leader opened a thinking window ({key})")
@@ -400,6 +461,7 @@ class ReplyMergePlugin(Star):
                                 window,
                                 elapsed=now - window.started_at,
                                 remaining=window.hard_cap - now,
+                                style_context=style_context,
                             )
                         except asyncio.CancelledError:
                             raise
@@ -412,15 +474,18 @@ class ReplyMergePlugin(Star):
                         passes += 1
                         if verdict is not None:
                             if verdict.action == "reply":
-                                quiet = THINK_REPLY_PAUSE
-                            else:
-                                quiet = min(
-                                    max(
-                                        verdict.wait,
-                                        float(self.config.get("min_wait", 5)),
-                                    ),
-                                    float(self.config.get("max_wait", 15)),
+                                # "reply" closes at the guaranteed floor,
+                                # never before it: min_wait counts from the
+                                # user's latest message, so even a premature
+                                # reply verdict keeps the reading time. The
+                                # short pause only applies once the floor is
+                                # already behind us.
+                                quiet = max(
+                                    THINK_REPLY_PAUSE,
+                                    window.last_activity + min_wait - time.monotonic(),
                                 )
+                            else:
+                                quiet = min(max(verdict.wait, min_wait), max_wait)
                             window.thoughts.append(verdict)
                             logger.info(
                                 f"[merge] thought pass {passes}: "

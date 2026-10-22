@@ -2,7 +2,7 @@ name: astrbot_plugin_reply_merge
 display_name: 思维链式消息防抖
 short_desc: 类思维链的消息防抖：像真人一样读完、想完再回，连发消息合并为一次回复
 desc: 用类思维链式的消息防抖机制，让回复更拟人。收到消息后不急着回：LLM 会像真人读消息一样逐条思考（逐条要点、总体判断、未决问题），判断用户是否说完——说完了就尽快回复，没说完就再安静等一会儿。期间用户连发的文字与表情包合并为一次请求，只回一条、一次说清；思考结论也会注入最终回复，让理解更完整。可用 /思维链 命令查看最近一轮思考（前缀随你的唤醒前缀配置）。
-version: 1.2.2
+version: 1.3.0
 author: Ye1xiaotian
 repo: https://github.com/Ye1xiaotian/astrbot_plugin_reply_merge
 tags:

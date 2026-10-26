@@ -67,6 +67,13 @@
         "type": "string",
         "default": ""
     },
+    "think_voice": {
+        "description": "思考语气模式",
+        "hint": "human：像真人在心里自言自语，一两句第一人称的心里话（默认，推荐）。structured：旧的「逐条要点 + 总体判断 + 未解决」分析格式，可用来回退或对比效果。",
+        "type": "string",
+        "options": ["human", "structured"],
+        "default": "human"
+    },
     "think_context": {
         "description": "思考时附带最近对话",
         "hint": "把最近几轮对话记录一并提供给思考模型，帮助理解“这个新话题和之前聊的有什么关系”。关闭后思考只看当前这批消息，理解会缺少前文。开启时如果 think_provider_id 指向第三方模型，这些聊天记录也会发送给它。",

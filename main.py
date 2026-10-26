@@ -320,28 +320,79 @@ class ReplyMergePlugin(Star):
     async def _style_context(self, event: AstrMessageEvent) -> str:
         """Resolve the voice the thought passes should write in.
 
-        The think_style override wins over the session persona, so the
-        persona prompt can be kept away from a third-party think provider.
-        The waiting hook runs before the request exists, so the persona is
-        read from the session config instead of the built system prompt.
+        The think_style override wins outright and is returned without
+        touching the persona manager, so the persona prompt can be kept
+        away from a third-party think provider. Otherwise the persona
+        actually in effect for this session is used, following the host's
+        precedence: a session rule persona, the conversation's /persona
+        choice, then the configured default persona, with the built-in
+        "default" and the webchat special default as last resorts. The
+        waiting hook runs before the request exists, so the persona is
+        resolved here instead of read from the built system prompt.
 
         Args:
             event: Incoming message event.
 
         Returns:
             Prompt text whose tone the thoughts should adopt; "" keeps the
-            neutral default style.
+            neutral default style. Never raises: an exception escaping the
+            waiting hook would skip the whole debounce.
         """
         style = str(self.config.get("think_style", "") or "").strip()
         if style:
             return style
+        umo = event.unified_msg_origin
         try:
-            runner = (
-                self.context.get_config(umo=event.unified_msg_origin).get(
-                    "agent_runner", {}
-                )
-                or {}
+            # The host resolves persona precedence from the conversation's
+            # /persona choice, so read it first; a missing conversation just
+            # leaves the config default in charge.
+            conversation_persona_id = None
+            conversation_id = (
+                await self.context.conversation_manager.get_curr_conversation_id(umo)
             )
+            if conversation_id:
+                conversation = await self.context.conversation_manager.get_conversation(
+                    umo, conversation_id
+                )
+                conversation_persona_id = (
+                    conversation.persona_id if conversation else None
+                )
+            (
+                persona_id,
+                persona,
+                _force_applied_persona_id,
+                _use_webchat_special_default,
+            ) = await self.context.persona_manager.resolve_selected_persona(
+                umo=umo,
+                conversation_persona_id=conversation_persona_id,
+                platform_name=event.get_platform_name(),
+                provider_settings=(
+                    self.context.get_config(umo=umo).get("provider_settings", {})
+                ),
+            )
+            if persona_id == "[%None]":
+                # The host uses this sentinel for "no persona at all"; keep
+                # the thought neutral instead of borrowing the default one.
+                return ""
+            if not persona:
+                # The resolver neither maps "default" to the built-in
+                # persona nor loads the webchat special default id, so finish
+                # the fallback here instead of dropping the persona.
+                persona = (
+                    self.context.persona_manager.get_persona_v3_by_id(persona_id)
+                    or self.context.persona_manager.selected_default_persona_v3
+                )
+            return str((persona or {}).get("prompt", "") or "")
+        except Exception as e:
+            logger.warning(
+                f"[merge] resolve_selected_persona failed ({e}); "
+                "falling back to the session config persona"
+            )
+        try:
+            # Compatibility path for cores without resolve_selected_persona:
+            # keep the historical session-config lookup rather than losing
+            # the persona entirely.
+            runner = self.context.get_config(umo=umo).get("agent_runner", {}) or {}
             runner_config = runner.get("config", {}) or {}
             if runner.get("runner_type") == "local":
                 persona_id = (runner_config.get("persona", {}) or {}).get(
@@ -589,9 +640,13 @@ class ReplyMergePlugin(Star):
         window = self.pending.get(merge_key(event))
         if window is None:
             return
-        # A handler that already produced a result replies on its own; folding
-        # this event in too would answer the same message twice.
-        if event.get_result() is not None:
+        # A handler that already replied on its own must not be answered a
+        # second time by the merged request. get_result() alone is not enough:
+        # the host clears it between handlers, so a reply another handler has
+        # already sent is invisible here. `_has_send_oper` is the durable
+        # "something was sent" flag; getattr keeps it optional because it is a
+        # host-internal attribute.
+        if event.get_result() is not None or getattr(event, "_has_send_oper", False):
             return
         text = (event.get_message_str() or "").strip()
         window.donate(
@@ -688,8 +743,7 @@ class ReplyMergePlugin(Star):
             self.orphaned[key] = still_waiting
         self.pending[key] = window
         thinking = bool(self.config.get("enable_thinking", True))
-        style_context = await self._style_context(event)
-        await self._hold_window(key, event, window, thinking, style_context)
+        await self._hold_window(key, event, window, thinking)
 
         # Park the window until merge_tail claims it. A request that dies
         # in between (no provider, another hook stopping the event) would
@@ -706,7 +760,6 @@ class ReplyMergePlugin(Star):
         event: AstrMessageEvent,
         window: MergeWindow,
         thinking: bool,
-        style_context: str,
     ) -> None:
         """Run the leader loop until the window closes.
 
@@ -720,7 +773,6 @@ class ReplyMergePlugin(Star):
             event: The leader event, passed to the thought passes.
             window: The open window to run.
             thinking: Whether thought passes are enabled.
-            style_context: Voice for the thought passes.
 
         Raises:
             asyncio.CancelledError: When the leader event is cancelled;
@@ -733,6 +785,11 @@ class ReplyMergePlugin(Star):
             # the window registered and silently swallowing every message.
             min_wait = float(self.config.get("min_wait", 5))
             max_wait = float(self.config.get("max_wait", 15))
+            # Resolve the thought voice inside the guard too: the lookup
+            # awaits the conversation/persona stores, and a cancellation
+            # landing there must still run the finally below instead of
+            # leaving the key registered with no leader to answer it.
+            style_context = await self._style_context(event) if thinking else ""
             logger.info(f"[merge] leader opened a thinking window ({key})")
             while True:
                 now = time.monotonic()
@@ -740,9 +797,16 @@ class ReplyMergePlugin(Star):
                     # Never cut a burst mid-sentence: if the user's latest
                     # message has not had min_wait to be read yet, give it
                     # that time instead of replying to a half-sent thought.
-                    floor = window.last_activity + min_wait
-                    if floor > now:
-                        await asyncio.sleep(min(floor - now, min_wait))
+                    # The grace is capped at hard_cap + min_wait: otherwise
+                    # every new message pushed the floor forward again and a
+                    # user talking faster than min_wait kept the window (and
+                    # this loop) open forever, swallowing every message.
+                    floor = min(
+                        window.last_activity + min_wait,
+                        window.hard_cap + min_wait,
+                    )
+                    if now < floor:
+                        await asyncio.sleep(floor - now)
                         continue
                     break
                 if window.wakeup.is_set():
@@ -893,7 +957,6 @@ class ReplyMergePlugin(Star):
                 event,
                 window,
                 bool(self.config.get("enable_thinking", True)),
-                await self._style_context(event),
             )
         event.set_extra("_reply_merge_window", None)
         key = merge_key(event)

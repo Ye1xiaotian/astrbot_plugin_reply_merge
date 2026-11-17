@@ -15,6 +15,7 @@ predicates is.
 import asyncio
 import importlib.util
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -111,6 +112,15 @@ class FakeEvent:
     def is_private_chat(self):
         return self._private
 
+    def get_message_str(self):
+        return "hello"
+
+    def get_message_outline(self):
+        return "hello"
+
+    def get_messages(self):
+        return []
+
     def get_extra(self, key, default=None):
         return self._extra.get(key, default)
 
@@ -197,11 +207,15 @@ def test_scope_gate(m):
 def test_stale_reply_discard(m):
     plugin = m.ReplyMergePlugin(None, {})
     old_window = m.MergeWindow(5.0, 60.0, first_message="old")
+    other_window = m.MergeWindow(5.0, 60.0, first_message="other")
     new_window = m.MergeWindow(5.0, 60.0, first_message="new")
+    key = "aiocqhttp:GroupMessage:1:u1"
     stale_event = FakeEvent()
     stale_event.set_extra("_reply_merge_from_window", old_window)
-    plugin.inflight["aiocqhttp:GroupMessage:1:u1"] = (old_window, 0.0)
-    plugin.stale["aiocqhttp:GroupMessage:1:u1"] = old_window
+    plugin.inflight[key] = (old_window, 0.0)
+    # Two stale windows may be pending at once; blanking one keeps the
+    # other marked.
+    plugin.stale[key] = {old_window, other_window}
 
     class Resp:
         completion_text = "old reply"
@@ -209,7 +223,8 @@ def test_stale_reply_discard(m):
     resp = Resp()
     asyncio.run(plugin.drop_stale_reply(stale_event, resp))
     assert resp.completion_text == "", resp.completion_text
-    assert "aiocqhttp:GroupMessage:1:u1" not in plugin.inflight
+    assert key not in plugin.inflight
+    assert plugin.stale[key] == {other_window}
 
     # A live (non-stale) reply passes through untouched.
     live_event = FakeEvent()
@@ -222,6 +237,62 @@ def test_stale_reply_discard(m):
     asyncio.run(plugin.drop_stale_reply(FakeEvent(), resp))
     assert resp.completion_text == "old reply"
     print("stale reply discard OK")
+
+
+def test_stale_content_rides(m):
+    """A window opened over an in-flight request carries its content.
+
+    The blanked reply's whole turn is dropped from the host history, so
+    the stale burst must ride with the newer window or it is never
+    answered at all.
+    """
+    settle, pause = m.THINK_SETTLE_SECONDS, m.THINK_REPLY_PAUSE
+    m.THINK_SETTLE_SECONDS = 0.05
+    m.THINK_REPLY_PAUSE = 0.05
+    try:
+        plugin = m.ReplyMergePlugin(
+            None,
+            {
+                "min_wait": 1,
+                "max_wait": 2,
+                "max_window": 30,
+                "enable_thinking": True,
+                "think_context": False,
+                "think_style": "",
+            },
+        )
+        event = FakeEvent()
+        key = m.merge_key(event)
+        inflight_window = m.MergeWindow(
+            1.0, 30.0, first_message="stale leader", leader_images=["img_stale"]
+        )
+        inflight_window.donate((1, 0, 1), "stale follow-up", [], [])
+        plugin.inflight[key] = (inflight_window, time.monotonic())
+
+        async def fake_think(
+            event, first_message, window, elapsed=0.0, remaining=0.0, style_context=""
+        ):
+            return m.Verdict([], "", [], "reply", 0.0)
+
+        plugin._think = fake_think
+        asyncio.run(plugin.hold_window(event))
+
+        new_window = event.get_extra("_reply_merge_window")
+        assert isinstance(new_window, m.MergeWindow)
+        assert plugin.stale[key] == {inflight_window}
+        # The stale burst rides whole: leader text and follow-up, plus its
+        # image, emptied out of the dead window so nothing answers twice.
+        assert new_window.earlier == ["- stale leader", "- stale follow-up"], (
+            new_window.earlier
+        )
+        assert new_window.earlier_count == 2
+        assert new_window.earlier_images == ["img_stale"]
+        assert inflight_window.rescued is True
+        assert not inflight_window.buffer and inflight_window.first_message == ""
+    finally:
+        m.THINK_SETTLE_SECONDS = settle
+        m.THINK_REPLY_PAUSE = pause
+    print("stale content rides OK")
 
 
 def test_lazy_loop(m):
@@ -293,6 +364,7 @@ def main() -> None:
     test_verdict_parsing(m)
     test_scope_gate(m)
     test_stale_reply_discard(m)
+    test_stale_content_rides(m)
     test_lazy_loop(m)
     print("ALL LOGIC TESTS PASSED")
 

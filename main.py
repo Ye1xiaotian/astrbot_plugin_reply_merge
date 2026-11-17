@@ -537,9 +537,9 @@ class ReplyMergePlugin(Star):
         # merge_tail and are generating; lets a newer window drop the
         # stale reply instead of sending two answers back to back.
         self.inflight: dict[str, tuple[MergeWindow, float]] = {}
-        # merge_key -> the in-flight window whose reply must be blanked
-        # when it lands, because a newer window will answer everything.
-        self.stale: dict[str, MergeWindow] = {}
+        # merge_key -> in-flight windows whose replies must be blanked
+        # when they land, because a newer window will answer everything.
+        self.stale: dict[str, set[MergeWindow]] = {}
         # Bounds concurrent thought passes across all windows so a group
         # burst cannot trip the provider's rate limit on every window at
         # once; see THINK_MAX_CONCURRENT.
@@ -777,7 +777,8 @@ class ReplyMergePlugin(Star):
         scope = str(self.config.get("usage_scope", "both") or "both").strip().lower()
         try:
             is_private = event.is_private_chat()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[merge] cannot tell the chat type ({e}); assuming group")
             is_private = False
         if scope == "group" and is_private:
             return False
@@ -1253,22 +1254,6 @@ class ReplyMergePlugin(Star):
             leader_order=self._arrival_key(event),
             leader_images=self._extract_attachments(event)[0],
         )
-        # A request of the previous window may still be generating; its
-        # reply would land before this window's and answer half the burst.
-        # Mark it stale: the response hook blanks it, the earlier messages
-        # stay unanswered in the history, and this window's reply — which
-        # reads that history — answers everything once. An entry older
-        # than INFLIGHT_MAX_AGE_SECONDS never fired its response hook (the
-        # request died), so it must not blank a live reply.
-        inflight = self.inflight.get(key)
-        if (
-            inflight is not None
-            and inflight[0] is not window
-            and time.monotonic() - inflight[1] <= INFLIGHT_MAX_AGE_SECONDS
-            and self.config.get("discard_inflight", True)
-        ):
-            self.stale[key] = inflight[0]
-            logger.info(f"[merge] marking the in-flight reply stale ({key})")
         # Fold back messages a leader swallowed but never got to answer.
         # A leader can die between this hook and merge_tail (provider
         # selection failure, another hook stopping the event), which would
@@ -1329,6 +1314,49 @@ class ReplyMergePlugin(Star):
             old.waits = []
         if still_waiting:
             self.orphaned[key] = still_waiting
+        # A request of the previous window may still be generating; its
+        # reply would land before this window's and answer half the burst.
+        # Mark it stale: the response hook blanks it, and the host drops
+        # the whole blanked turn from the history — including the user
+        # message that carried the stale burst — so this window must carry
+        # that content itself: it rides in `earlier` (after the rescued
+        # orphans, which are older) and is answered once here. An inflight
+        # entry older than INFLIGHT_MAX_AGE_SECONDS never fired its
+        # response hook (the request died), so it must neither blank a
+        # live reply nor resurrect dead content.
+        inflight = self.inflight.get(key)
+        if (
+            inflight is not None
+            and inflight[0] is not window
+            and time.monotonic() - inflight[1] <= INFLIGHT_MAX_AGE_SECONDS
+            and self.config.get("discard_inflight", True)
+        ):
+            stale_window = inflight[0]
+            self.stale.setdefault(key, set()).add(stale_window)
+            stale_count = stale_window.earlier_count + len(stale_window.buffer)
+            window.earlier.extend(stale_window.earlier)
+            if stale_window.first_message:
+                window.earlier.append(f"- {stale_window.first_message}")
+                stale_count += 1
+            stale_before, stale_after = stale_window.ordered_messages()
+            window.earlier.extend(stale_before)
+            window.earlier.extend(line for message in stale_after for line in message)
+            window.earlier_count += stale_count
+            window.earlier_images.extend(stale_window.earlier_images)
+            window.earlier_images.extend(stale_window.leader_images)
+            window.earlier_images.extend(stale_window.images)
+            stale_window.rescued = True
+            stale_window.first_message = ""
+            stale_window.leader_images = []
+            stale_window.earlier = []
+            stale_window.earlier_count = 0
+            stale_window.earlier_images = []
+            stale_window.buffer = []
+            stale_window.images = []
+            logger.info(
+                f"[merge] in-flight reply goes stale; its {stale_count} "
+                f"messages ride with the new window ({key})"
+            )
         self.pending[key] = window
         thinking = bool(self.config.get("enable_thinking", True))
         await self._hold_window(key, event, window, thinking)
@@ -1626,6 +1654,10 @@ class ReplyMergePlugin(Star):
         # Track this request as in-flight so a window opened while it
         # generates can blank its reply. The extra survives into the
         # response hook and names which window this response belongs to.
+        # Stale marking itself only happens in the waiting hook, so the
+        # third-party fallback below never discards: its requests queue on
+        # the session lock, and nothing of this session is in flight by
+        # the time one of them runs.
         self.inflight[key] = (window, time.monotonic())
         event.set_extra("_reply_merge_from_window", window)
 
@@ -1787,9 +1819,9 @@ class ReplyMergePlugin(Star):
         The host fires this after the model answered and before anything
         goes out; an empty completion makes it skip both the send and the
         history record, so the stale answer simply never appears. The
-        earlier messages stay unanswered in the history the newer window
-        reads, so its reply covers everything once. Streaming replies
-        cannot be retracted this way — turn the option off there.
+        newer window carries the stale burst's content in its own prompt
+        (copied when it was marked), so nothing goes unanswered. Streaming
+        replies cannot be retracted this way — turn the option off there.
 
         Args:
             event: The request's event, carrying the window marker set by
@@ -1803,8 +1835,11 @@ class ReplyMergePlugin(Star):
         tracked = self.inflight.get(key)
         if tracked is not None and tracked[0] is window:
             self.inflight.pop(key, None)
-        if self.stale.get(key) is window:
-            self.stale.pop(key, None)
+        stale_windows = self.stale.get(key)
+        if stale_windows and window in stale_windows:
+            stale_windows.discard(window)
+            if not stale_windows:
+                self.stale.pop(key, None)
             logger.info(f"[merge] dropped a reply superseded by a newer window ({key})")
             resp.completion_text = ""
 

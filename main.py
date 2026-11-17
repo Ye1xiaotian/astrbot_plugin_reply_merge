@@ -41,12 +41,19 @@ Window lifecycle (per merge key = unified_msg_origin:sender_id):
   which an older message's answer could land after a newer one's.
 - Messages arriving while the window is open are stopped at the event
   handler stage; their text/images are donated to the window and the
-  leader is woken up to think again.
+  leader is woken up. Evaluation is lazy: a few stray follow-ups only
+  re-arm the reading floor, and the leader thinks once more when the
+  quiet deadline expires (a burst past THINK_EAGER_MESSAGES is judged
+  while it flows).
 - The loop exits when the verdict-armed deadline passes with no new
   messages, the verdict says reply, or the hard cap (window start +
   max_window) is reached. The finished window rides on the event into
   on_llm_request, where the thought block and the donated follow-ups are
   appended to the prompt right before the persona call.
+- A window opened while the previous request is still generating marks
+  that reply stale; the on_llm_response hook blanks it so the newer
+  window's reply is the only answer. Chats listed in the scope config
+  skip all of this entirely.
 """
 
 from __future__ import annotations
@@ -63,7 +70,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, File, Forward, Image, Record, Video
 from astrbot.api.platform import MessageType
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
 # Legacy structured prompt: asks for points/summary/questions. Still used
@@ -114,6 +121,26 @@ THINK_SETTLE_SECONDS = 1.0
 # Upper bound of thought passes per window, bounding LLM cost when a user
 # keeps talking until the hard cap.
 THINK_PASS_LIMIT = 10
+# Donations that accumulate before the leader thinks mid-burst. Below this,
+# new messages only slide the quiet floor (lazy evaluation): the verdict's
+# wait already encodes "I think they are done", so a stray follow-up needs
+# no fresh pass — one final pass runs when the deadline expires with
+# unseen messages. A burst past this threshold still folds into eager
+# passes so a fast typers' stream is judged while it flows.
+THINK_EAGER_MESSAGES = 3
+# Thought passes running at the same time across all windows. Several
+# group members @-ing at once would otherwise fire as many parallel calls
+# as there are windows and trip the provider's rate limit, degrading every
+# window to random quiet at once; queued passes wait at most one call
+# timeout and then degrade alone.
+THINK_MAX_CONCURRENT = 3
+# A merged request is tracked as in-flight from merge_tail until its
+# response hook fires. A request that dies without a response (provider
+# failure) never fires the hook, so an entry older than this is treated as
+# dead instead of poisoning the next window's stale-reply discard.
+# Generations longer than this are rare; the orphan machinery covers the
+# rest.
+INFLIGHT_MAX_AGE_SECONDS = 300.0
 # Human-feel pause used when the verdict action is "reply" AND the
 # per-message min_wait floor has already passed; it only avoids an
 # instant bot-like answer.
@@ -379,6 +406,13 @@ class MergeWindow:
         # Set when a newer window has taken this window's content over; a
         # request still queued for this window must then not answer again.
         self.rescued = False
+        # Messages donated since the last thought pass that actually read
+        # them. Lazy evaluation lets a few follow-ups pile up and only
+        # thinks once at the deadline instead of once per message.
+        self.unseen = 0
+        # Why the leader loop exited ("quiet" or "hard_cap"); merge_tail
+        # tells the persona when the burst was cut off at the time cap.
+        self.close_reason = ""
         self.thoughts: list[Verdict] = []
         self.waits: list[float] = []
         # How many of all_images() the thought passes have already been
@@ -432,6 +466,7 @@ class MergeWindow:
             lines.append(f"- [{label}]")
         if lines:
             self.buffer.append((order, lines))
+            self.unseen += 1
         self.last_activity = time.monotonic()
         self.wakeup.set()
 
@@ -498,6 +533,17 @@ class ReplyMergePlugin(Star):
         self.config = config
         # merge_key -> MergeWindow, present only while a leader is waiting.
         self.pending: dict[str, MergeWindow] = {}
+        # merge_key -> (MergeWindow, armed_at) for requests that left
+        # merge_tail and are generating; lets a newer window drop the
+        # stale reply instead of sending two answers back to back.
+        self.inflight: dict[str, tuple[MergeWindow, float]] = {}
+        # merge_key -> the in-flight window whose reply must be blanked
+        # when it lands, because a newer window will answer everything.
+        self.stale: dict[str, MergeWindow] = {}
+        # Bounds concurrent thought passes across all windows so a group
+        # burst cannot trip the provider's rate limit on every window at
+        # once; see THINK_MAX_CONCURRENT.
+        self._think_gate = asyncio.Semaphore(THINK_MAX_CONCURRENT)
         # merge_key -> [(closed_at, window)] for windows that closed but were
         # never claimed by merge_tail; older entries may be rescued.
         self.orphaned: dict[str, list[tuple[float, MergeWindow]]] = {}
@@ -711,6 +757,42 @@ class ReplyMergePlugin(Star):
                 text = text[:THINK_CONTEXT_CHARS].rstrip() + "…"
             lines.append((others if role == "user" else "你") + "：" + text)
         return "\n".join(lines)
+
+    def _debounce_enabled(self, event: AstrMessageEvent) -> bool:
+        """Tell whether debounce applies to this chat at all.
+
+        A disabled chat behaves as if the plugin were not installed: no
+        window opens, nothing is donated or stopped, replies go out
+        untouched. Checked at every entry point (the follow-up collector,
+        the waiting hook and the third-party fallback in merge_tail) so
+        the three paths can never disagree.
+
+        Args:
+            event: Incoming message event.
+
+        Returns:
+            False when the chat type is out of usage_scope, or the session
+            or the sender is blacklisted.
+        """
+        scope = str(self.config.get("usage_scope", "both") or "both").strip().lower()
+        try:
+            is_private = event.is_private_chat()
+        except Exception:
+            is_private = False
+        if scope == "group" and is_private:
+            return False
+        if scope == "private" and not is_private:
+            return False
+        sessions = self.config.get("disabled_sessions", []) or []
+        if isinstance(sessions, list) and (
+            event.unified_msg_origin in sessions
+            or event.message_obj.session_id in sessions
+        ):
+            return False
+        users = self.config.get("disabled_users", []) or []
+        if isinstance(users, list) and event.get_sender_id() in users:
+            return False
+        return True
 
     def _is_local_runner(self, event: AstrMessageEvent) -> bool:
         """Tell whether this session uses the built-in local agent runner.
@@ -1021,14 +1103,27 @@ class ReplyMergePlugin(Star):
             else:
                 lines.append("请输出这一轮的 JSON。")
 
-            resp = await asyncio.wait_for(
-                provider.text_chat(
-                    prompt="\n".join(lines),
-                    system_prompt=system_prompt,
-                    image_urls=think_images or None,
-                ),
-                timeout=THINK_CALL_TIMEOUT,
-            )
+            # Queue behind other windows' passes instead of adding to a
+            # rate-limit stampede; a pass that cannot start within one
+            # call timeout degrades to random quiet on its own.
+            try:
+                await asyncio.wait_for(
+                    self._think_gate.acquire(), timeout=THINK_CALL_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[merge] thinking queue is full; random quiet")
+                return None
+            try:
+                resp = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt="\n".join(lines),
+                        system_prompt=system_prompt,
+                        image_urls=think_images or None,
+                    ),
+                    timeout=THINK_CALL_TIMEOUT,
+                )
+            finally:
+                self._think_gate.release()
             raw = (resp.completion_text or "").strip()
         except asyncio.CancelledError:
             raise
@@ -1065,6 +1160,8 @@ class ReplyMergePlugin(Star):
         Args:
             event: Incoming message event.
         """
+        if not self._debounce_enabled(event):
+            return
         # Platform notices (member joined, recalled, etc.) are not part of
         # the user's burst.
         if event.get_message_type() == MessageType.OTHER_MESSAGE:
@@ -1131,6 +1228,8 @@ class ReplyMergePlugin(Star):
         Args:
             event: Incoming message event.
         """
+        if not self._debounce_enabled(event):
+            return
         key = merge_key(event)
         window = self.pending.get(key)
         if window is not None:
@@ -1154,6 +1253,22 @@ class ReplyMergePlugin(Star):
             leader_order=self._arrival_key(event),
             leader_images=self._extract_attachments(event)[0],
         )
+        # A request of the previous window may still be generating; its
+        # reply would land before this window's and answer half the burst.
+        # Mark it stale: the response hook blanks it, the earlier messages
+        # stay unanswered in the history, and this window's reply — which
+        # reads that history — answers everything once. An entry older
+        # than INFLIGHT_MAX_AGE_SECONDS never fired its response hook (the
+        # request died), so it must not blank a live reply.
+        inflight = self.inflight.get(key)
+        if (
+            inflight is not None
+            and inflight[0] is not window
+            and time.monotonic() - inflight[1] <= INFLIGHT_MAX_AGE_SECONDS
+            and self.config.get("discard_inflight", True)
+        ):
+            self.stale[key] = inflight[0]
+            logger.info(f"[merge] marking the in-flight reply stale ({key})")
         # Fold back messages a leader swallowed but never got to answer.
         # A leader can die between this hook and merge_tail (provider
         # selection failure, another hook stopping the event), which would
@@ -1297,87 +1412,119 @@ class ReplyMergePlugin(Star):
                     if now < floor:
                         await asyncio.sleep(floor - now)
                         continue
+                    window.close_reason = "hard_cap"
                     break
+                want_pass = False
                 if window.wakeup.is_set():
                     window.wakeup.clear()
                     if thinking and passes < THINK_PASS_LIMIT:
-                        # Let a rapid burst settle, then reason over all
-                        # messages seen so far (chain: previous thought in).
-                        await asyncio.sleep(THINK_SETTLE_SECONDS)
-                        now = time.monotonic()
-                        try:
-                            verdict = await self._think(
-                                event,
-                                window.first_message,
-                                window,
-                                elapsed=now - window.started_at,
-                                remaining=window.hard_cap - now,
-                                style_context=style_context,
-                            )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            # Safety net: any escape from the thinking
-                            # layer must degrade to a fallback pass, never
-                            # abort the window and skip the debounce.
-                            logger.exception("[merge] thought pass crashed")
-                            verdict = None
-                        passes += 1
-                        if verdict is not None:
-                            if verdict.action == "reply":
-                                # "reply" closes at the guaranteed floor,
-                                # never before it: min_wait counts from the
-                                # user's latest message, so even a premature
-                                # reply verdict keeps the reading time. The
-                                # short pause only applies once the floor is
-                                # already behind us.
-                                quiet = max(
-                                    THINK_REPLY_PAUSE,
-                                    window.last_activity + min_wait - time.monotonic(),
-                                )
-                            else:
-                                quiet = min(max(verdict.wait, min_wait), max_wait)
-                            window.thoughts.append(verdict)
-                            brief = (
-                                verdict.summary
-                                or " ".join(verdict.thought.split())[:60]
-                            )
-                            logger.info(
-                                f"[merge] thought pass {passes}: "
-                                f"action={verdict.action} "
-                                f"requested={verdict.wait:.0f}s "
-                                f"effective={quiet:.0f}s | {brief}"
-                            )
+                        if passes == 0 or window.unseen >= THINK_EAGER_MESSAGES:
+                            want_pass = True
                         else:
-                            quiet = self._random_quiet()
-                            window.thoughts.append(
-                                Verdict([], "", [], "fallback", quiet)
+                            # Lazy evaluation: a stray follow-up does not
+                            # re-question the running verdict. It only
+                            # re-arms the guaranteed reading floor, and one
+                            # final pass judges everything when the
+                            # deadline expires.
+                            window.deadline = min(
+                                window.hard_cap,
+                                max(
+                                    window.deadline,
+                                    window.last_activity + min_wait,
+                                ),
                             )
-                            logger.info(
-                                f"[merge] thought pass {passes}: fallback "
-                                f"effective={quiet:.0f}s"
-                            )
-                        window.waits.append(quiet)
-                        window.deadline = min(window.hard_cap, time.monotonic() + quiet)
-                        continue
-                    # Thinking disabled or exhausted: slide like the old
-                    # random debounce so follow-ups still extend the wait.
-                    window.deadline = min(
-                        window.hard_cap, time.monotonic() + self._random_quiet()
-                    )
-                remaining = window.deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+                    else:
+                        # Thinking disabled or exhausted: slide like the old
+                        # random debounce so follow-ups still extend the
+                        # wait.
+                        window.deadline = min(
+                            window.hard_cap, time.monotonic() + self._random_quiet()
+                        )
+                if not want_pass:
+                    remaining = window.deadline - time.monotonic()
+                    expired = remaining <= 0
+                    if not expired:
+                        try:
+                            await asyncio.wait_for(window.wakeup.wait(), remaining)
+                        except asyncio.TimeoutError:
+                            if time.monotonic() >= window.hard_cap:
+                                # The quiet deadline was the hard cap itself:
+                                # go back through the loop-top check so the
+                                # user's last message still gets its min_wait
+                                # reading time instead of being cut off at
+                                # the cap.
+                                continue
+                            expired = True
+                        else:
+                            # A donation woke the leader; re-decide at the
+                            # top of the loop.
+                            continue
+                    if expired and not (
+                        thinking and passes < THINK_PASS_LIMIT and window.unseen > 0
+                    ):
+                        window.close_reason = "quiet"
+                        break
+                    # Expired with unread messages: fall through to the one
+                    # final thought pass below, which judges everything the
+                    # lazy slides let pile up.
+                # One thought pass, eager on the leader's own message or a
+                # fast burst, final at the deadline: let a rapid burst
+                # settle, then reason over all messages seen so far (chain:
+                # previous thought in).
+                await asyncio.sleep(THINK_SETTLE_SECONDS)
+                now = time.monotonic()
                 try:
-                    await asyncio.wait_for(window.wakeup.wait(), remaining)
-                except asyncio.TimeoutError:
-                    if time.monotonic() >= window.hard_cap:
-                        # The quiet deadline was the hard cap itself: go
-                        # back through the loop-top check so the user's
-                        # last message still gets its min_wait reading
-                        # time instead of being cut off at the cap.
-                        continue
-                    break
+                    verdict = await self._think(
+                        event,
+                        window.first_message,
+                        window,
+                        elapsed=now - window.started_at,
+                        remaining=window.hard_cap - now,
+                        style_context=style_context,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Safety net: any escape from the thinking
+                    # layer must degrade to a fallback pass, never
+                    # abort the window and skip the debounce.
+                    logger.exception("[merge] thought pass crashed")
+                    verdict = None
+                passes += 1
+                if verdict is not None:
+                    if verdict.action == "reply":
+                        # "reply" closes at the guaranteed floor,
+                        # never before it: min_wait counts from the
+                        # user's latest message, so even a premature
+                        # reply verdict keeps the reading time. The
+                        # short pause only applies once the floor is
+                        # already behind us.
+                        quiet = max(
+                            THINK_REPLY_PAUSE,
+                            window.last_activity + min_wait - time.monotonic(),
+                        )
+                    else:
+                        quiet = min(max(verdict.wait, min_wait), max_wait)
+                    window.thoughts.append(verdict)
+                    # A failed pass keeps unseen, so the retry at the next
+                    # deadline still reads the messages it missed.
+                    window.unseen = 0
+                    brief = verdict.summary or " ".join(verdict.thought.split())[:60]
+                    logger.info(
+                        f"[merge] thought pass {passes}: "
+                        f"action={verdict.action} "
+                        f"requested={verdict.wait:.0f}s "
+                        f"effective={quiet:.0f}s | {brief}"
+                    )
+                else:
+                    quiet = self._random_quiet()
+                    window.thoughts.append(Verdict([], "", [], "fallback", quiet))
+                    logger.info(
+                        f"[merge] thought pass {passes}: fallback "
+                        f"effective={quiet:.0f}s"
+                    )
+                window.waits.append(quiet)
+                window.deadline = min(window.hard_cap, time.monotonic() + quiet)
         except asyncio.CancelledError:
             if window.first_message or window.buffer:
                 logger.warning(
@@ -1422,6 +1569,8 @@ class ReplyMergePlugin(Star):
         window = event.get_extra("_reply_merge_window")
         if not isinstance(window, MergeWindow):
             if self._is_local_runner(event):
+                return
+            if not self._debounce_enabled(event):
                 return
             # Third-party agent runners never fire the waiting hook, so
             # this one is their only chance to debounce. It runs under the
@@ -1474,6 +1623,11 @@ class ReplyMergePlugin(Star):
             self.orphaned[key] = parked
         else:
             self.orphaned.pop(key, None)
+        # Track this request as in-flight so a window opened while it
+        # generates can blank its reply. The extra survives into the
+        # response hook and names which window this response belongs to.
+        self.inflight[key] = (window, time.monotonic())
+        event.set_extra("_reply_merge_from_window", window)
 
         try:
             before, after = window.ordered_messages()
@@ -1524,6 +1678,15 @@ class ReplyMergePlugin(Star):
             long_note = (
                 "；这条消息不短，回复时照顾到全部内容，别只顺着这段思考里提到的那一点接"
                 if merged_chars > THINK_LONG_CONTENT_CHARS
+                else ""
+            )
+            # A window closed by the time cap, not by quiet, means the user
+            # may still have more to say; the reply should know that.
+            cap_note = (
+                f"[这轮等待是到时长上限才收尾的，{who}可能还有话没说完；"
+                f"回复时自然地接住已收到的内容就好，也可以顺带问一句还有没有下文"
+                f"（校验码 {window.nonce}）]"
+                if window.close_reason == "hard_cap"
                 else ""
             )
             thought_marker = (
@@ -1582,18 +1745,20 @@ class ReplyMergePlugin(Star):
                 # The leader's own text is the tail of req.prompt, so an
                 # earlier message would otherwise be read after it. Rebuild
                 # the prompt in sending order: earlier, before, leader,
-                # thought, after.
+                # cap note, thought, after.
                 blocks = [block for block in (earlier_block, before_block) if block]
                 blocks.append(
                     f"[以下是{who}最后发来的一条消息（校验码 {window.nonce}）]\n"
                     f"{leader_text}"
                 )
-                blocks.extend(block for block in (thought_block, after_block) if block)
+                blocks.extend(
+                    block for block in (cap_note, thought_block, after_block) if block
+                )
                 req.prompt = "\n\n".join(blocks)
             else:
                 tail = "\n\n".join(
                     block
-                    for block in (thought_block, earlier_block, after_block)
+                    for block in (cap_note, thought_block, earlier_block, after_block)
                     if block
                 )
                 if tail:
@@ -1612,6 +1777,36 @@ class ReplyMergePlugin(Star):
                 req.image_urls.extend(forwarded_images[: limit * 2])
         except Exception:
             logger.exception("[merge] merge tail failed; replying without merge blocks")
+
+    @filter.on_llm_response()
+    async def drop_stale_reply(
+        self, event: AstrMessageEvent, resp: LLMResponse
+    ) -> None:
+        """Blank the reply of a request superseded by a newer window.
+
+        The host fires this after the model answered and before anything
+        goes out; an empty completion makes it skip both the send and the
+        history record, so the stale answer simply never appears. The
+        earlier messages stay unanswered in the history the newer window
+        reads, so its reply covers everything once. Streaming replies
+        cannot be retracted this way — turn the option off there.
+
+        Args:
+            event: The request's event, carrying the window marker set by
+                merge_tail.
+            resp: The finished LLM response.
+        """
+        window = event.get_extra("_reply_merge_from_window")
+        if not isinstance(window, MergeWindow):
+            return
+        key = merge_key(event)
+        tracked = self.inflight.get(key)
+        if tracked is not None and tracked[0] is window:
+            self.inflight.pop(key, None)
+        if self.stale.get(key) is window:
+            self.stale.pop(key, None)
+            logger.info(f"[merge] dropped a reply superseded by a newer window ({key})")
+            resp.completion_text = ""
 
     @filter.command("思维链", alias={"thoughts", "思考链"})
     async def show_thoughts(self, event: AstrMessageEvent):

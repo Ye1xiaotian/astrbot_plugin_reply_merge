@@ -79,5 +79,30 @@
         "hint": "把最近几轮对话记录一并提供给思考模型，帮助理解“这个新话题和之前聊的有什么关系”。关闭后思考只看当前这批消息，理解会缺少前文。开启时如果 think_provider_id 指向第三方模型，这些聊天记录也会发送给它。",
         "type": "bool",
         "default": true
+    },
+    "usage_scope": {
+        "description": "生效范围",
+        "hint": "选择在哪些聊天里启用防抖：both=全部（默认）、group=仅群聊、private=仅私聊。管理群等不适合等待的场景可配合下面的名单完全关闭。",
+        "type": "string",
+        "options": ["both", "group", "private"],
+        "default": "both"
+    },
+    "disabled_sessions": {
+        "description": "不启用防抖的会话名单",
+        "hint": "填入会话标识（形如 aiocqhttp:GroupMessage:123456 的完整标识，或纯数字的会话 ID），名单内的聊天完全不做防抖、立即回复，就像没装这个插件。",
+        "type": "list",
+        "default": []
+    },
+    "disabled_users": {
+        "description": "不启用防抖的用户名单",
+        "hint": "填入用户 QQ 号/平台 ID，名单内用户的消息完全不做防抖、立即回复。",
+        "type": "list",
+        "default": []
+    },
+    "discard_inflight": {
+        "description": "作废被新消息取代的在途回复",
+        "hint": "机器人正在打字回复时用户又发了新消息：开启后，旧回复会被悄悄丢弃，新消息并入一次合并回复，不会再连收两条。注意：使用流式回复时已流出的分段收不回来，建议流式场景关闭本项。",
+        "type": "bool",
+        "default": true
     }
 }
